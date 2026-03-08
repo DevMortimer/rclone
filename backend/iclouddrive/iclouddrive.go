@@ -38,11 +38,22 @@ import (
 */
 
 const (
-	configAppleID    = "apple_id"
-	configPassword   = "password"
-	configClientID   = "client_id"
-	configCookies    = "cookies"
-	configTrustToken = "trust_token"
+	configAppleID     = "apple_id"
+	configPassword    = "password"
+	configClientID    = "client_id"
+	configCookies     = "cookies"
+	configTrustToken  = "trust_token"
+	configAnisette    = "anisette_url"
+	configUserID      = "user_id"
+	configDeviceID    = "device_id"
+	configADSID       = "adsid"
+	configIDMSToken   = "idms_token"
+	configSessionID   = "session_id"
+	configScnt        = "scnt"
+	configSessionTok  = "session_token"
+	configAcctCountry = "account_country"
+	configPending2FA  = "pending_2fa"
+	defaultClientID   = "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d"
 
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
@@ -86,7 +97,66 @@ func init() {
 			Help:     "Client id",
 			Required: false,
 			Advanced: true,
-			Default:  "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d",
+			Default:  defaultClientID,
+		}, {
+			Name:     configAnisette,
+			Help:     "URL of an anisette provider used for modern Apple login.",
+			Required: false,
+			Advanced: true,
+			Default:  api.DefaultAnisetteURL(),
+		}, {
+			Name:      configUserID,
+			Help:      "Device user identifier (internal use)",
+			Required:  false,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
+		}, {
+			Name:      configDeviceID,
+			Help:      "Device identifier (internal use)",
+			Required:  false,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
+		}, {
+			Name:      configADSID,
+			Help:      "Apple directory services identifier (internal use)",
+			Required:  false,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
+		}, {
+			Name:      configIDMSToken,
+			Help:      "GrandSlam 2FA token (internal use)",
+			Required:  false,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
+		}, {
+			Name:      configSessionID,
+			Help:      "Apple auth session identifier (internal use)",
+			Required:  false,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
+		}, {
+			Name:      configScnt,
+			Help:      "Apple auth challenge token (internal use)",
+			Required:  false,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
+		}, {
+			Name:      configSessionTok,
+			Help:      "Apple session token (internal use)",
+			Required:  false,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
+		}, {
+			Name:      configAcctCountry,
+			Help:      "Apple account country (internal use)",
+			Required:  false,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
+		}, {
+			Name:     configPending2FA,
+			Help:     "Whether the current config flow is awaiting 2FA (internal use)",
+			Required: false,
+			Hide:     fs.OptionHideBoth,
 		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
@@ -107,6 +177,9 @@ type Options struct {
 	TrustToken string               `config:"trust_token"`
 	Cookies    string               `config:"cookies"`
 	ClientID   string               `config:"client_id"`
+	Anisette   string               `config:"anisette_url"`
+	UserID     string               `config:"user_id"`
+	DeviceID   string               `config:"device_id"`
 	Enc        encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -156,6 +229,19 @@ func Config(ctx context.Context, name string, m configmap.Mapper, config fs.Conf
 	trustToken, _ := m.Get(configTrustToken)
 	cookieRaw, _ := m.Get(configCookies)
 	clientID, _ := m.Get(configClientID)
+	anisetteURL, _ := m.Get(configAnisette)
+	userID, _ := m.Get(configUserID)
+	deviceID, _ := m.Get(configDeviceID)
+	adsid, _ := m.Get(configADSID)
+	idmsToken, _ := m.Get(configIDMSToken)
+	sessionID, _ := m.Get(configSessionID)
+	scnt, _ := m.Get(configScnt)
+	sessionToken, _ := m.Get(configSessionTok)
+	accountCountry, _ := m.Get(configAcctCountry)
+	pending2FA, _ := m.Get(configPending2FA)
+	if clientID == "" {
+		clientID = defaultClientID
+	}
 	cookies := ReadCookies(cookieRaw)
 
 	switch config.State {
@@ -164,13 +250,37 @@ func Config(ctx context.Context, name string, m configmap.Mapper, config fs.Conf
 		if err != nil {
 			return nil, err
 		}
+		icloud.Session.SetAnisetteURL(anisetteURL)
+		icloud.Session.SetDeviceIDs(userID, deviceID)
 		if err := icloud.Authenticate(ctx); err != nil {
 			return nil, err
 		}
+		m.Set(configTrustToken, icloud.Session.TrustToken)
+		m.Set(configAnisette, icloud.Session.AnisetteURL())
+		m.Set(configUserID, icloud.Session.UserID)
+		m.Set(configDeviceID, icloud.Session.DeviceID)
+		m.Set(configADSID, icloud.Session.ADSID)
+		m.Set(configIDMSToken, icloud.Session.IDMSToken)
+		m.Set(configSessionID, icloud.Session.SessionID)
+		m.Set(configScnt, icloud.Session.Scnt)
+		m.Set(configSessionTok, icloud.Session.SessionToken)
+		m.Set(configAcctCountry, icloud.Session.AccountCountry)
+		m.Set(configPending2FA, fmt.Sprintf("%t", icloud.Session.Pending2FA))
 		m.Set(configCookies, icloud.Session.GetCookieString())
 		if icloud.Session.Requires2FA() {
-			return fs.ConfigInput("2fa_do", "config_2fa", "Two-factor authentication: please enter your 2FA code")
+			return fs.ConfigInput("2fa_do", "config_2fa", "Two-factor authentication: please enter the code shown on your trusted Apple device")
 		}
+		if err := icloud.EnsurePCSForServiceOnce(ctx, "iclouddrive"); err != nil {
+			fs.Infof(name, "ADP web access setup during config will be retried on first use: %v", err)
+		}
+		m.Set(configTrustToken, icloud.Session.TrustToken)
+		m.Set(configAnisette, icloud.Session.AnisetteURL())
+		m.Set(configUserID, icloud.Session.UserID)
+		m.Set(configDeviceID, icloud.Session.DeviceID)
+		m.Set(configCookies, icloud.Session.GetCookieString())
+		m.Set(configADSID, "")
+		m.Set(configIDMSToken, "")
+		m.Set(configPending2FA, "")
 		return nil, nil
 	case "2fa_do":
 		code := config.Result
@@ -182,15 +292,36 @@ func Config(ctx context.Context, name string, m configmap.Mapper, config fs.Conf
 		if err != nil {
 			return nil, err
 		}
-		if err := icloud.SignIn(ctx); err != nil {
-			return nil, err
-		}
-
+		icloud.Session.SetAnisetteURL(anisetteURL)
+		icloud.Session.SetDeviceIDs(userID, deviceID)
+		icloud.Session.ADSID = adsid
+		icloud.Session.IDMSToken = idmsToken
+		icloud.Session.SessionID = sessionID
+		icloud.Session.Scnt = scnt
+		icloud.Session.SessionToken = sessionToken
+		icloud.Session.AccountCountry = accountCountry
+		icloud.Session.Pending2FA = strings.EqualFold(pending2FA, "true")
 		if err := icloud.Session.Validate2FACode(ctx, code); err != nil {
 			return nil, err
 		}
+		if err := icloud.Session.PrimeSetupSession(ctx); err != nil {
+			return nil, err
+		}
+		if err := icloud.EnsurePCSForServiceOnce(ctx, "iclouddrive"); err != nil {
+			fs.Infof(name, "ADP web access setup during reconnect will be retried on first use: %v", err)
+		}
 
 		m.Set(configTrustToken, icloud.Session.TrustToken)
+		m.Set(configAnisette, icloud.Session.AnisetteURL())
+		m.Set(configUserID, icloud.Session.UserID)
+		m.Set(configDeviceID, icloud.Session.DeviceID)
+		m.Set(configADSID, "")
+		m.Set(configIDMSToken, "")
+		m.Set(configSessionID, icloud.Session.SessionID)
+		m.Set(configScnt, icloud.Session.Scnt)
+		m.Set(configSessionTok, icloud.Session.SessionToken)
+		m.Set(configAcctCountry, icloud.Session.AccountCountry)
+		m.Set(configPending2FA, "")
 		m.Set(configCookies, icloud.Session.GetCookieString())
 		return nil, nil
 
@@ -809,14 +940,23 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 	}
 
-	if opt.TrustToken == "" {
-		return nil, fmt.Errorf("missing icloud trust token: try refreshing it with \"rclone config reconnect %s:\"", name)
-	}
-
 	cookies := ReadCookies(opt.Cookies)
 
 	callback := func(session *api.Session) {
-		m.Set(configCookies, session.GetCookieString())
+		for key, value := range map[string]string{
+			configCookies:     session.GetCookieString(),
+			configTrustToken:  session.TrustToken,
+			configUserID:      session.UserID,
+			configDeviceID:    session.DeviceID,
+			configSessionID:   session.SessionID,
+			configScnt:        session.Scnt,
+			configSessionTok:  session.SessionToken,
+			configAcctCountry: session.AccountCountry,
+		} {
+			if err := config.SetValueAndSave(name, key, value); err != nil {
+				fs.Errorf(name, "failed to save %q for updated iCloud session: %v", key, err)
+			}
+		}
 	}
 
 	icloud, err := api.New(
@@ -830,13 +970,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, err
 	}
+	icloud.Session.SetAnisetteURL(opt.Anisette)
+	icloud.Session.SetDeviceIDs(opt.UserID, opt.DeviceID)
 
 	if err := icloud.Authenticate(ctx); err != nil {
 		return nil, err
 	}
 
 	if icloud.Session.Requires2FA() {
-		return nil, errors.New("trust token expired, please reauth")
+		return nil, errors.New("re-authentication requires two-factor approval; run rclone config reconnect")
 	}
 
 	root = strings.Trim(root, "/")
@@ -855,7 +997,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}).Fill(ctx, f)
 
 	rootID := f.rootID
-	f.service, err = icloud.DriveService()
+	f.service, err = icloud.DriveService(ctx)
 	if err != nil {
 		return nil, err
 	}

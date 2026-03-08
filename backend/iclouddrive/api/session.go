@@ -1,20 +1,23 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/url"
-	"slices"
+	"regexp"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/oracle/oci-go-sdk/v65/common"
-	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/lib/rest"
 )
 
-// Session represents an iCloud session
+// Session represents an iCloud session.
 type Session struct {
 	SessionToken   string         `json:"session_token"`
 	Scnt           string         `json:"scnt"`
@@ -24,24 +27,30 @@ type Session struct {
 	ClientID       string         `json:"client_id"`
 	Cookies        []*http.Cookie `json:"cookies"`
 	AccountInfo    AccountInfo    `json:"account_info"`
+	UserID         string         `json:"user_id"`
+	DeviceID       string         `json:"device_id"`
+	ADSID          string         `json:"adsid"`
+	IDMSToken      string         `json:"idms_token"`
+	Pending2FA     bool           `json:"pending_2fa"`
 
-	srv *rest.Client `json:"-"`
+	srv      *rest.Client      `json:"-"`
+	anisette *anisetteProvider `json:"-"`
 }
 
-// String returns the session as a string
-// func (s *Session) String() string {
-// 	jsession, _ := json.Marshal(s)
-// 	return string(jsession)
-// }
-
-// Request makes a request
+// Request makes a JSON request.
 func (s *Session) Request(ctx context.Context, opts rest.Opts, request any, response any) (*http.Response, error) {
 	resp, err := s.srv.CallJSON(ctx, &opts, &request, &response)
-
-	if err != nil {
-		return resp, err
+	if resp != nil {
+		s.captureResponse(resp)
 	}
+	return resp, err
+}
 
+func (s *Session) captureResponse(resp *http.Response) {
+	s.CaptureCookies(resp)
+	if resp == nil {
+		return
+	}
 	if val := resp.Header.Get("X-Apple-ID-Account-Country"); val != "" {
 		s.AccountCountry = val
 	}
@@ -57,49 +66,206 @@ func (s *Session) Request(ctx context.Context, opts rest.Opts, request any, resp
 	if val := resp.Header.Get("scnt"); val != "" {
 		s.Scnt = val
 	}
-
-	return resp, nil
 }
 
-// Requires2FA returns true if the session requires 2FA
+// CaptureCookies merges response cookies into the session cookie set.
+func (s *Session) CaptureCookies(resp *http.Response) {
+	if resp == nil {
+		return
+	}
+	for _, ck := range resp.Cookies() {
+		s.AddOrReplaceCookie(ck)
+	}
+}
+
+// SetAnisetteURL updates the anisette provider used for modern Apple login.
+func (s *Session) SetAnisetteURL(rawURL string) {
+	if s.anisette == nil {
+		s.anisette = newAnisetteProvider(rawURL, newAppleHTTPClient())
+		return
+	}
+	if rawURL == "" {
+		rawURL = defaultAnisetteURL
+	}
+	s.anisette.url = rawURL
+}
+
+// AnisetteURL returns the current anisette endpoint.
+func (s *Session) AnisetteURL() string {
+	if s.anisette == nil || s.anisette.url == "" {
+		return defaultAnisetteURL
+	}
+	return s.anisette.url
+}
+
+// SetDeviceIDs restores the persisted Apple virtual-device identifiers.
+func (s *Session) SetDeviceIDs(userID, deviceID string) {
+	if userID != "" {
+		s.UserID = userID
+	}
+	if deviceID != "" {
+		s.DeviceID = deviceID
+	}
+}
+
+// Requires2FA returns true if the session requires 2FA.
 func (s *Session) Requires2FA() bool {
-	return s.AccountInfo.DsInfo.HsaVersion == 2 && s.AccountInfo.HsaChallengeRequired
+	return s.Pending2FA || (s.AccountInfo.DsInfo != nil && s.AccountInfo.DsInfo.HsaVersion == 2 && s.AccountInfo.HsaChallengeRequired)
 }
 
-// SignIn signs in the session
+// DSID returns the account DSID from account info or the web-auth user cookie.
+func (s *Session) DSID() string {
+	if s.AccountInfo.DsInfo != nil && s.AccountInfo.DsInfo.Dsid != "" {
+		return s.AccountInfo.DsInfo.Dsid
+	}
+	if s == nil {
+		return ""
+	}
+	if s.ADSID != "" {
+		return s.ADSID
+	}
+	re := regexp.MustCompile(`(?:^|:)d=([0-9]+)`)
+	if m := re.FindStringSubmatch(s.CookieValue("X-APPLE-WEBAUTH-USER")); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// CookieValue returns a cookie value by name.
+func (s *Session) CookieValue(name string) string {
+	for _, ck := range s.Cookies {
+		if ck != nil && ck.Name == name {
+			return ck.Value
+		}
+	}
+	return ""
+}
+
+// ResetAuthState clears transient auth/session fields before a fresh sign-in.
+func (s *Session) ResetAuthState(clearTrustToken bool) {
+	s.Cookies = nil
+	s.SessionToken = ""
+	s.Scnt = ""
+	s.SessionID = ""
+	s.AccountCountry = ""
+	s.ADSID = ""
+	s.IDMSToken = ""
+	s.Pending2FA = false
+	s.AccountInfo = AccountInfo{}
+	if clearTrustToken {
+		s.TrustToken = ""
+	}
+}
+
+// AuthenticateWithPassword performs Apple's iCloud web SRP login flow.
+func (s *Session) AuthenticateWithPassword(ctx context.Context, appleID, password string) error {
+	if err := s.SignIn(ctx, appleID, password); err != nil {
+		return err
+	}
+	return s.AuthWithToken(ctx)
+}
+
+// SignIn performs the SRP-based sign-in flow used by icloud.com.
 func (s *Session) SignIn(ctx context.Context, appleID, password string) error {
+	if s.UserID == "" {
+		s.UserID = uuid.NewString()
+	}
+	if s.DeviceID == "" {
+		s.DeviceID = uuid.NewString()
+	}
+
+	srpSession, err := newAppleSRPSession()
+	if err != nil {
+		return err
+	}
+
+	var initResp struct {
+		Iteration int    `json:"iteration"`
+		Salt      string `json:"salt"`
+		Protocol  string `json:"protocol"`
+		B         string `json:"b"`
+		C         string `json:"c"`
+	}
+	opts := rest.Opts{
+		Method:       "POST",
+		Path:         "/signin/init",
+		RootURL:      authEndpoint,
+		ExtraHeaders: s.GetAuthHeaders(map[string]string{"Accept": "application/json, text/javascript, */*; q=0.01"}),
+		IgnoreStatus: true,
+	}
+	initReq := map[string]any{
+		"a":           base64.StdEncoding.EncodeToString(srpSession.ClientEphemeral()),
+		"accountName": appleID,
+		"protocols":   []string{"s2k", "s2k_fo"},
+	}
+	resp, err := s.Request(ctx, opts, initReq, &initResp)
+	if err != nil {
+		return err
+	}
+	if resp != nil && resp.StatusCode >= 400 {
+		return fmt.Errorf("SRP init failed")
+	}
+
+	salt, err := base64.StdEncoding.DecodeString(initResp.Salt)
+	if err != nil {
+		return err
+	}
+	serverEphemeral, err := base64.StdEncoding.DecodeString(initResp.B)
+	if err != nil {
+		return err
+	}
+	derivedPassword, err := encryptPassword(password, salt, initResp.Iteration, initResp.Protocol)
+	if err != nil {
+		return err
+	}
+	proofs, err := srpSession.Complete(appleID, salt, derivedPassword, serverEphemeral)
+	if err != nil {
+		return err
+	}
+
 	trustTokens := []string{}
 	if s.TrustToken != "" {
 		trustTokens = []string{s.TrustToken}
 	}
-	values := map[string]any{
+	var completeResp map[string]any
+	completeReq := map[string]any{
 		"accountName": appleID,
-		"password":    password,
+		"c":           initResp.C,
+		"m1":          base64.StdEncoding.EncodeToString(proofs.ClientProof),
+		"m2":          base64.StdEncoding.EncodeToString(proofs.ServerProof),
 		"rememberMe":  true,
 		"trustTokens": trustTokens,
 	}
-	body, err := IntoReader(values)
+	resp, err = s.Request(ctx, rest.Opts{
+		Method:       "POST",
+		Path:         "/signin/complete",
+		RootURL:      authEndpoint,
+		ExtraHeaders: s.GetAuthHeaders(map[string]string{"Accept": "application/json, text/javascript, */*; q=0.01"}),
+		IgnoreStatus: true,
+	}, completeReq, &completeResp)
 	if err != nil {
 		return err
 	}
-	opts := rest.Opts{
-		Method:       "POST",
-		Path:         "/signin",
-		Parameters:   url.Values{},
-		ExtraHeaders: s.GetAuthHeaders(map[string]string{}),
-		RootURL:      authEndpoint,
-		IgnoreStatus: true, // need to handle 409 for hsa2
-		NoResponse:   true,
-		Body:         body,
+	if resp != nil && resp.StatusCode >= 400 {
+		if resp.StatusCode == 409 && s.SessionToken != "" {
+			return nil
+		}
+		if errors, ok := completeResp["serviceErrors"].([]any); ok && len(errors) > 0 {
+			if first, ok := errors[0].(map[string]any); ok {
+				if msg, ok := first["message"].(string); ok && msg != "" {
+					return fmt.Errorf("SRP password challenge failed: %s", msg)
+				}
+			}
+		}
+		if msg, ok := completeResp["errorMessage"].(string); ok && msg != "" {
+			return fmt.Errorf("SRP password challenge failed: %s", msg)
+		}
+		return fmt.Errorf("SRP password challenge failed")
 	}
-	opts.Parameters.Set("isRememberMeEnabled", "true")
-	_, err = s.Request(ctx, opts, nil, nil)
-
-	return err
-
+	return nil
 }
 
-// AuthWithToken authenticates the session
+// AuthWithToken authenticates the session with the setup endpoint.
 func (s *Session) AuthWithToken(ctx context.Context) error {
 	values := map[string]any{
 		"accountCountryCode": s.AccountCountry,
@@ -114,20 +280,150 @@ func (s *Session) AuthWithToken(ctx context.Context) error {
 	opts := rest.Opts{
 		Method:       "POST",
 		Path:         "/accountLogin",
-		ExtraHeaders: GetCommonHeaders(map[string]string{}),
+		ExtraHeaders: s.GetHeaders(map[string]string{}),
 		RootURL:      setupEndpoint,
 		Body:         body,
 	}
 
-	resp, err := s.Request(ctx, opts, nil, &s.AccountInfo)
-	if err == nil {
-		s.Cookies = resp.Cookies()
+	_, err = s.Request(ctx, opts, nil, &s.AccountInfo)
+	if err != nil {
+		return err
 	}
-
-	return err
+	s.Pending2FA = s.AccountInfo.HsaChallengeRequired
+	return nil
 }
 
-// Validate2FACode validates the 2FA code
+func (s *Session) gsaRequest(ctx context.Context, parameters map[string]any) (map[string]any, error) {
+	cpd, err := s.anisette.cpd(ctx, s.UserID, s.DeviceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to obtain anisette headers from %q: %w", s.AnisetteURL(), err)
+	}
+
+	body, err := marshalPlist(map[string]any{
+		"Header": map[string]any{"Version": "1.0.1"},
+		"Request": mergeAny(map[string]any{
+			"cpd": cpd,
+		}, parameters),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := s.srv.Call(ctx, &rest.Opts{
+		Method:      "POST",
+		RootURL:     "https://gsa.apple.com/grandslam/GsService2",
+		ContentType: "text/x-xml-plist",
+		Body:        bytes.NewReader(body),
+		ExtraHeaders: map[string]string{
+			"Accept":            "*/*",
+			"X-MMe-Client-Info": anisetteClientInfo,
+			uaOverrideKey:       grandslamUserAgent,
+		},
+	})
+	if resp != nil {
+		s.captureResponse(resp)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	rootValue, err := unmarshalPlist(raw)
+	if err != nil {
+		return nil, err
+	}
+	root, err := plistMap(rootValue)
+	if err != nil {
+		return nil, err
+	}
+	return plistMap(root["Response"])
+}
+
+func (s *Session) loginMobileMe(ctx context.Context, appleID, idmsPET string) error {
+	headers, err := s.anisette.headers(ctx, s.UserID, s.DeviceID, false)
+	if err != nil {
+		return fmt.Errorf("failed to obtain anisette headers from %q: %w", s.AnisetteURL(), err)
+	}
+	headers["X-Apple-ADSID"] = s.ADSID
+	headers["X-Mme-Client-Info"] = mobileMeClientInfo
+	headers[uaOverrideKey] = mobileMeUserAgent
+
+	body, err := marshalPlist(map[string]any{
+		"apple-id": appleID,
+		"delegates": map[string]any{
+			"com.apple.mobileme": map[string]any{},
+		},
+		"password":  idmsPET,
+		"client-id": s.UserID,
+	})
+	if err != nil {
+		return err
+	}
+
+	resp, err := s.srv.Call(ctx, &rest.Opts{
+		Method:       "POST",
+		RootURL:      "https://setup.icloud.com/setup/iosbuddy/loginDelegates",
+		ContentType:  "text/x-xml-plist",
+		UserName:     appleID,
+		Password:     idmsPET,
+		Body:         bytes.NewReader(body),
+		ExtraHeaders: headers,
+	})
+	if resp != nil {
+		s.captureResponse(resp)
+	}
+	if err != nil {
+		return fmt.Errorf("loginDelegates failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	rootValue, err := unmarshalPlist(raw)
+	if err != nil {
+		return err
+	}
+	root, err := plistMap(rootValue)
+	if err != nil {
+		return err
+	}
+	if delegates, ok := root["delegates"]; ok {
+		delegateMap, err := plistMap(delegates)
+		if err == nil {
+			if mobileme, ok := delegateMap["com.apple.mobileme"]; ok {
+				serviceData, err := plistMap(mobileme)
+				if err == nil {
+					if status, ok := serviceData["status"]; ok {
+						if code, _ := plistInt(status); code != 0 {
+							msg, _ := plistString(serviceData["status-message"])
+							return fmt.Errorf("com.apple.mobileme login failed with status %d: %s", code, msg)
+						}
+					}
+				}
+			}
+		}
+	}
+	if status, ok := root["status"]; ok {
+		if code, _ := plistInt(status); code != 0 {
+			msg, _ := plistString(root["status-message"])
+			return fmt.Errorf("loginDelegates failed with status %d: %s", code, msg)
+		}
+	}
+	return nil
+}
+
+// RequestTrustedDevice2FA is handled implicitly by Apple's web flow.
+func (s *Session) RequestTrustedDevice2FA(ctx context.Context) error {
+	return nil
+}
+
+// Validate2FACode validates the trusted-device code.
 func (s *Session) Validate2FACode(ctx context.Context, code string) error {
 	values := map[string]any{"securityCode": map[string]string{"code": code}}
 	body, err := IntoReader(values)
@@ -139,51 +435,78 @@ func (s *Session) Validate2FACode(ctx context.Context, code string) error {
 	headers["scnt"] = s.Scnt
 	headers["X-Apple-ID-Session-Id"] = s.SessionID
 
-	opts := rest.Opts{
+	_, err = s.Request(ctx, rest.Opts{
 		Method:       "POST",
 		Path:         "/verify/trusteddevice/securitycode",
 		ExtraHeaders: headers,
 		RootURL:      authEndpoint,
 		Body:         body,
 		NoResponse:   true,
+	}, nil, nil)
+	if err != nil {
+		return fmt.Errorf("validate2FACode failed: %w", err)
 	}
-
-	_, err = s.Request(ctx, opts, nil, nil)
-	if err == nil {
-		if err := s.TrustSession(ctx); err != nil {
-			return err
-		}
-
-		return nil
+	if err := s.TrustSession(ctx); err != nil {
+		return err
 	}
-
-	return fmt.Errorf("validate2FACode failed: %w", err)
+	s.Pending2FA = false
+	return nil
 }
 
-// TrustSession trusts the session
+// TrustSession trusts the session.
 func (s *Session) TrustSession(ctx context.Context) error {
 	headers := s.GetAuthHeaders(map[string]string{})
 	headers["scnt"] = s.Scnt
 	headers["X-Apple-ID-Session-Id"] = s.SessionID
 
-	opts := rest.Opts{
+	_, err := s.Request(ctx, rest.Opts{
 		Method:        "GET",
 		Path:          "/2sv/trust",
 		ExtraHeaders:  headers,
 		RootURL:       authEndpoint,
 		NoResponse:    true,
 		ContentLength: common.Int64(0),
-	}
-
-	_, err := s.Request(ctx, opts, nil, nil)
+	}, nil, nil)
 	if err != nil {
 		return fmt.Errorf("trustSession failed: %w", err)
 	}
-
 	return s.AuthWithToken(ctx)
 }
 
-// ValidateSession validates the session
+// PrimeSetupSession performs a lenient setup validation round-trip after 2FA.
+// Apple currently returns a non-2xx response shape here, but it still refreshes
+// setup cookies and trust-token state needed by later PCS calls.
+func (s *Session) PrimeSetupSession(ctx context.Context) error {
+	opts := rest.Opts{
+		Method:        "POST",
+		Path:          "/validate",
+		ExtraHeaders:  s.GetHeaders(map[string]string{}),
+		RootURL:       setupEndpoint,
+		ContentLength: common.Int64(0),
+		IgnoreStatus:  true,
+	}
+
+	var response struct {
+		Success     bool     `json:"success"`
+		TrustTokens []string `json:"trustTokens"`
+	}
+	resp, err := s.Request(ctx, opts, nil, &response)
+	if err != nil {
+		return fmt.Errorf("primeSetupSession failed: %w", err)
+	}
+	if len(response.TrustTokens) > 0 {
+		s.TrustToken = response.TrustTokens[0]
+	}
+	if resp != nil && (resp.StatusCode >= 200 && resp.StatusCode <= 299 || resp.StatusCode == 421) {
+		return nil
+	}
+	if resp != nil {
+		return fmt.Errorf("primeSetupSession failed: unexpected status %d", resp.StatusCode)
+	}
+	return fmt.Errorf("primeSetupSession failed: no response")
+}
+
+// ValidateSession validates the session.
 func (s *Session) ValidateSession(ctx context.Context) error {
 	opts := rest.Opts{
 		Method:        "POST",
@@ -196,14 +519,11 @@ func (s *Session) ValidateSession(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("validateSession failed: %w", err)
 	}
-
+	s.Pending2FA = false
 	return nil
 }
 
 // GetAuthHeaders returns the authentication headers for the session.
-//
-// It takes an `overwrite` map[string]string parameter which allows
-// overwriting the default headers. It returns a map[string]string.
 func (s *Session) GetAuthHeaders(overwrite map[string]string) map[string]string {
 	headers := map[string]string{
 		"Accept":                           "application/json",
@@ -218,13 +538,16 @@ func (s *Session) GetAuthHeaders(overwrite map[string]string) map[string]string 
 		"X-Apple-Widget-Key":               s.ClientID,
 		"Origin":                           homeEndpoint,
 		"Referer":                          fmt.Sprintf("%s/", homeEndpoint),
-		"User-Agent":                       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:103.0) Gecko/20100101 Firefox/103.0",
+		uaOverrideKey:                      browserUA,
+	}
+	if cookies := s.GetCookieString(); cookies != "" {
+		headers["Cookie"] = cookies
 	}
 	maps.Copy(headers, overwrite)
 	return headers
 }
 
-// GetHeaders Gets the authentication headers required for a request
+// GetHeaders gets the authentication headers required for a request.
 func (s *Session) GetHeaders(overwrite map[string]string) map[string]string {
 	headers := GetCommonHeaders(map[string]string{})
 	headers["Cookie"] = s.GetCookieString()
@@ -234,12 +557,17 @@ func (s *Session) GetHeaders(overwrite map[string]string) map[string]string {
 
 // GetCookieString returns the cookie header string for the session.
 func (s *Session) GetCookieString() string {
-	cookieHeader := ""
-	// we only care about name and value.
+	var cookieHeader strings.Builder
 	for _, cookie := range s.Cookies {
-		cookieHeader = cookieHeader + cookie.Name + "=" + cookie.Value + ";"
+		if cookie == nil || cookie.Name == "" || cookie.Value == "" {
+			continue
+		}
+		cookieHeader.WriteString(cookie.Name)
+		cookieHeader.WriteString("=")
+		cookieHeader.WriteString(cookie.Value)
+		cookieHeader.WriteString(";")
 	}
-	return cookieHeader
+	return cookieHeader.String()
 }
 
 // GetCommonHeaders generates common HTTP headers with optional overwrite.
@@ -248,31 +576,34 @@ func GetCommonHeaders(overwrite map[string]string) map[string]string {
 		"Content-Type": "application/json",
 		"Origin":       baseEndpoint,
 		"Referer":      fmt.Sprintf("%s/", baseEndpoint),
-		"User-Agent":   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:103.0) Gecko/20100101 Firefox/103.0",
+		uaOverrideKey:  browserUA,
 	}
 	maps.Copy(headers, overwrite)
 	return headers
 }
 
-// MergeCookies merges two slices of http.Cookies, ensuring no duplicates are added.
-func MergeCookies(left []*http.Cookie, right []*http.Cookie) ([]*http.Cookie, error) {
-	var hashes []string
-	for _, cookie := range right {
-		hashes = append(hashes, cookie.Raw)
+// AddOrReplaceCookie adds or replaces a cookie using name/domain/path as identity.
+func (s *Session) AddOrReplaceCookie(ck *http.Cookie) {
+	if ck == nil || ck.Name == "" {
+		return
 	}
-	for _, cookie := range left {
-		if !slices.Contains(hashes, cookie.Raw) {
-			right = append(right, cookie)
+	for i, existing := range s.Cookies {
+		if existing != nil && existing.Name == ck.Name && existing.Domain == ck.Domain && existing.Path == ck.Path {
+			s.Cookies[i] = ck
+			return
 		}
 	}
-	return right, nil
+	s.Cookies = append(s.Cookies, ck)
 }
 
 // GetCookiesForDomain filters the provided cookies based on the domain of the given URL.
 func GetCookiesForDomain(url *url.URL, cookies []*http.Cookie) ([]*http.Cookie, error) {
 	var domainCookies []*http.Cookie
 	for _, cookie := range cookies {
-		if strings.HasSuffix(url.Host, cookie.Domain) {
+		if cookie == nil {
+			continue
+		}
+		if cookie.Domain == "" || strings.HasSuffix(url.Host, cookie.Domain) {
 			domainCookies = append(domainCookies, cookie)
 		}
 	}
@@ -280,14 +611,31 @@ func GetCookiesForDomain(url *url.URL, cookies []*http.Cookie) ([]*http.Cookie, 
 }
 
 // NewSession creates a new Session instance with default values.
-func NewSession() *Session {
-	session := &Session{}
-	session.srv = rest.NewClient(fshttp.NewClient(context.Background())).SetRoot(baseEndpoint)
-	//session.ClientID = "auth-" + uuid.New().String()
+func NewSession(httpClient *http.Client) *Session {
+	if httpClient == nil {
+		httpClient = newAppleHTTPClient()
+	}
+	session := &Session{
+		UserID:   uuid.NewString(),
+		DeviceID: uuid.NewString(),
+	}
+	session.srv = rest.NewClient(httpClient).SetRoot(baseEndpoint)
+	session.anisette = newAnisetteProvider(defaultAnisetteURL, httpClient)
 	return session
 }
 
-// AccountInfo represents an account info
+func mergeAny(base map[string]any, extra map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
+}
+
+// AccountInfo represents an account info.
 type AccountInfo struct {
 	DsInfo                       *ValidateDataDsInfo    `json:"dsInfo"`
 	HasMinimumDeviceForPhotosWeb bool                   `json:"hasMinimumDeviceForPhotosWeb"`
@@ -330,7 +678,7 @@ type AccountInfo struct {
 	Apps map[string]*ValidateDataApp `json:"apps"`
 }
 
-// ValidateDataDsInfo represents an validation info
+// ValidateDataDsInfo represents validation info.
 type ValidateDataDsInfo struct {
 	HsaVersion                         int      `json:"hsaVersion"`
 	LastName                           string   `json:"lastName"`
@@ -391,13 +739,13 @@ type ValidateDataDsInfo struct {
 	FamilyEligible bool   `json:"familyEligible"`
 }
 
-// ValidateDataApp represents an app
+// ValidateDataApp represents an app.
 type ValidateDataApp struct {
 	CanLaunchWithOneFactor bool `json:"canLaunchWithOneFactor"`
 	IsQualifiedForBeta     bool `json:"isQualifiedForBeta"`
 }
 
-// WebService represents a web service
+// WebService represents a web service.
 type webService struct {
 	PcsRequired bool   `json:"pcsRequired"`
 	URL         string `json:"url"`
