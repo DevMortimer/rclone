@@ -948,42 +948,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	cookies := ReadCookies(opt.Cookies)
-	obscuredPassword := ""
-	if opt.Password != "" {
-		obscuredPassword = obscure.MustObscure(opt.Password)
-	}
-	clientID := opt.ClientID
-	if clientID == "" {
-		clientID = defaultClientID
-	}
-
-	callback := func(session *api.Session) {
-		for key, value := range map[string]string{
-			"type":            "iclouddrive",
-			configAppleID:     opt.AppleID,
-			configPassword:    obscuredPassword,
-			configClientID:    clientID,
-			configAnisette:    session.AnisetteURL(),
-			configCookies:     session.GetCookieString(),
-			configTrustToken:  session.TrustToken,
-			configUserID:      session.UserID,
-			configDeviceID:    session.DeviceID,
-			configSessionID:   session.SessionID,
-			configScnt:        session.Scnt,
-			configSessionTok:  session.SessionToken,
-			configAcctCountry: session.AccountCountry,
-		} {
-			config.FileSetValue(name, key, value)
-		}
-		for key, value := range map[string]string{
-			configADSID:      session.ADSID,
-			configIDMSToken:  session.IDMSToken,
-			configPending2FA: fmt.Sprintf("%t", session.Pending2FA),
-		} {
-			config.FileSetValue(name, key, value)
-		}
-		config.SaveConfig()
-	}
 
 	icloud, err := api.New(
 		opt.AppleID,
@@ -991,7 +955,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt.TrustToken,
 		opt.ClientID,
 		cookies,
-		callback,
+		nil,
 	)
 	if err != nil {
 		return nil, err
