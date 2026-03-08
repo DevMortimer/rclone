@@ -558,7 +558,7 @@ func (s *Session) GetHeaders(overwrite map[string]string) map[string]string {
 // GetCookieString returns the cookie header string for the session.
 func (s *Session) GetCookieString() string {
 	var cookieHeader strings.Builder
-	for _, cookie := range s.Cookies {
+	for _, cookie := range dedupeCookiesByName(s.Cookies) {
 		if cookie == nil || cookie.Name == "" || cookie.Value == "" {
 			continue
 		}
@@ -568,6 +568,23 @@ func (s *Session) GetCookieString() string {
 		cookieHeader.WriteString(";")
 	}
 	return cookieHeader.String()
+}
+
+func dedupeCookiesByName(cookies []*http.Cookie) []*http.Cookie {
+	seen := make(map[string]int)
+	out := make([]*http.Cookie, 0, len(cookies))
+	for _, ck := range cookies {
+		if ck == nil || ck.Name == "" || ck.Value == "" {
+			continue
+		}
+		if i, ok := seen[ck.Name]; ok {
+			out[i] = ck
+			continue
+		}
+		seen[ck.Name] = len(out)
+		out = append(out, ck)
+	}
+	return out
 }
 
 // GetCommonHeaders generates common HTTP headers with optional overwrite.
@@ -588,7 +605,14 @@ func (s *Session) AddOrReplaceCookie(ck *http.Cookie) {
 		return
 	}
 	for i, existing := range s.Cookies {
-		if existing != nil && existing.Name == ck.Name && existing.Domain == ck.Domain && existing.Path == ck.Path {
+		if existing == nil || existing.Name != ck.Name {
+			continue
+		}
+		if existing.Domain == ck.Domain && existing.Path == ck.Path {
+			s.Cookies[i] = ck
+			return
+		}
+		if (existing.Domain == "" && existing.Path == "") || (ck.Domain == "" && ck.Path == "") {
 			s.Cookies[i] = ck
 			return
 		}
@@ -599,7 +623,7 @@ func (s *Session) AddOrReplaceCookie(ck *http.Cookie) {
 // GetCookiesForDomain filters the provided cookies based on the domain of the given URL.
 func GetCookiesForDomain(url *url.URL, cookies []*http.Cookie) ([]*http.Cookie, error) {
 	var domainCookies []*http.Cookie
-	for _, cookie := range cookies {
+	for _, cookie := range dedupeCookiesByName(cookies) {
 		if cookie == nil {
 			continue
 		}

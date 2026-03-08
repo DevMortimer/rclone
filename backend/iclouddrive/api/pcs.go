@@ -77,7 +77,7 @@ func (c *Client) CookieHeaderFor(root string) string {
 	domainCookies, _ := GetCookiesForDomain(u, c.Session.Cookies)
 
 	var b strings.Builder
-	for _, ck := range domainCookies {
+	for _, ck := range dedupeCookiesByName(domainCookies) {
 		if ck != nil && ck.Name != "" && ck.Value != "" {
 			fmt.Fprintf(&b, "%s=%s; ", ck.Name, ck.Value)
 		}
