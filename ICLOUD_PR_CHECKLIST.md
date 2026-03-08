@@ -13,16 +13,16 @@ Manual checks worth running before opening the PR.
 
 ## Basic listing
 
-- [ ] `./rclone ls icloud:`
-- [ ] `./rclone lsd icloud:`
-- [ ] `./rclone --max-depth=1 ls icloud:`
+- [x] `./rclone ls icloud:`
+- [x] `./rclone lsd icloud:`
+- [x] `./rclone --max-depth=1 ls icloud:`
 
 ## Directory operations
 
-- [ ] `./rclone mkdir icloud:rclone-test`
-- [ ] `./rclone lsd icloud:`
-- [ ] `./rclone rmdir icloud:rclone-test`
-- [ ] Nested directory create/remove:
+- [x] `./rclone mkdir icloud:rclone-test`
+- [x] `./rclone lsd icloud:`
+- [x] `./rclone rmdir icloud:rclone-test`
+- [x] Nested directory create/remove:
 
 ```bash
 ./rclone mkdir icloud:rclone-test/a/b/c
@@ -32,12 +32,12 @@ Manual checks worth running before opening the PR.
 
 ## File operations
 
-- [ ] Upload a small file.
-- [ ] Download it back.
-- [ ] Read it with `cat`.
-- [ ] Delete it.
-- [ ] Move/rename it.
-- [ ] Overwrite an existing file.
+- [x] Upload a small file.
+- [x] Download it back.
+- [x] Read it with `cat`.
+- [x] Delete it.
+- [x] Move/rename it.
+- [x] Overwrite an existing file.
 
 ```bash
 printf 'hello\n' > /tmp/rclone-hello.txt
@@ -50,9 +50,9 @@ printf 'hello\n' > /tmp/rclone-hello.txt
 
 ## Sync behavior
 
-- [ ] `sync --dry-run`
-- [ ] Real `sync`
-- [ ] Confirm deletes propagate as expected on a disposable tree
+- [x] `sync --dry-run`
+- [x] Real `sync`
+- [x] Confirm deletes propagate as expected on a disposable tree
 
 ```bash
 mkdir -p /tmp/rclone-sync-test/sub

@@ -948,9 +948,22 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	cookies := ReadCookies(opt.Cookies)
+	obscuredPassword := ""
+	if opt.Password != "" {
+		obscuredPassword = obscure.MustObscure(opt.Password)
+	}
+	clientID := opt.ClientID
+	if clientID == "" {
+		clientID = defaultClientID
+	}
 
 	callback := func(session *api.Session) {
 		for key, value := range map[string]string{
+			"type":            "iclouddrive",
+			configAppleID:     opt.AppleID,
+			configPassword:    obscuredPassword,
+			configClientID:    clientID,
+			configAnisette:    session.AnisetteURL(),
 			configCookies:     session.GetCookieString(),
 			configTrustToken:  session.TrustToken,
 			configUserID:      session.UserID,
@@ -960,10 +973,16 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			configSessionTok:  session.SessionToken,
 			configAcctCountry: session.AccountCountry,
 		} {
-			if err := config.SetValueAndSave(name, key, value); err != nil {
-				fs.Errorf(name, "failed to save %q for updated iCloud session: %v", key, err)
-			}
+			config.FileSetValue(name, key, value)
 		}
+		for key, value := range map[string]string{
+			configADSID:      session.ADSID,
+			configIDMSToken:  session.IDMSToken,
+			configPending2FA: fmt.Sprintf("%t", session.Pending2FA),
+		} {
+			config.FileSetValue(name, key, value)
+		}
+		config.SaveConfig()
 	}
 
 	icloud, err := api.New(
