@@ -405,13 +405,16 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		return err
 	}
 
-	if check {
-		item, found, err := f.findItem(ctx, dir)
-		if err != nil {
-			return err
-		}
+	item, found, err := f.findItem(ctx, dir)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fs.ErrorDirNotFound
+	}
 
-		if found && item.DirectChildrenCount > 0 {
+	if check {
+		if item.DirectChildrenCount > 0 {
 			return fs.ErrorDirectoryNotEmpty
 		}
 	}
@@ -419,7 +422,11 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	var _ *api.DriveItem
 	var resp *http.Response
 	if err = f.pacer.Call(func() (bool, error) {
-		_, resp, err = f.service.MoveItemToTrashByID(ctx, directoryID, etag, true)
+		if item.Itemid != "" {
+			_, resp, err = f.service.MoveItemToTrashByItemID(ctx, item.Itemid, etag, true)
+		} else {
+			_, resp, err = f.service.MoveItemToTrashByID(ctx, directoryID, etag, true)
+		}
 		return retryResultUnknown(ctx, resp, err)
 	}); err != nil {
 		return err

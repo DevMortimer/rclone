@@ -1,0 +1,96 @@
+# iCloud Drive PR Checklist
+
+Manual checks worth running before opening the PR.
+
+## Auth and session
+
+- [ ] Create a fresh `iclouddrive` remote from scratch.
+- [ ] Confirm Apple sign-in succeeds.
+- [ ] Confirm trusted-device 2FA succeeds.
+- [ ] If ADP is enabled, confirm first real access completes PCS consent/cookie staging.
+- [ ] Run `./rclone -vv config reconnect icloud:` and confirm it completes.
+- [ ] Run `./rclone -vv ls icloud:` after reconnect and confirm the saved session works.
+
+## Basic listing
+
+- [ ] `./rclone ls icloud:`
+- [ ] `./rclone lsd icloud:`
+- [ ] `./rclone --max-depth=1 ls icloud:`
+
+## Directory operations
+
+- [ ] `./rclone mkdir icloud:rclone-test`
+- [ ] `./rclone lsd icloud:`
+- [ ] `./rclone rmdir icloud:rclone-test`
+- [ ] Nested directory create/remove:
+
+```bash
+./rclone mkdir icloud:rclone-test/a/b/c
+./rclone lsd icloud:rclone-test/a/b
+./rclone purge icloud:rclone-test
+```
+
+## File operations
+
+- [ ] Upload a small file.
+- [ ] Download it back.
+- [ ] Read it with `cat`.
+- [ ] Delete it.
+- [ ] Move/rename it.
+- [ ] Overwrite an existing file.
+
+```bash
+printf 'hello\n' > /tmp/rclone-hello.txt
+./rclone copyto /tmp/rclone-hello.txt icloud:rclone-test/hello.txt
+./rclone cat icloud:rclone-test/hello.txt
+./rclone copyto icloud:rclone-test/hello.txt /tmp/rclone-hello-back.txt
+./rclone moveto icloud:rclone-test/hello.txt icloud:rclone-test/renamed.txt
+./rclone delete icloud:rclone-test/renamed.txt
+```
+
+## Sync behavior
+
+- [ ] `sync --dry-run`
+- [ ] Real `sync`
+- [ ] Confirm deletes propagate as expected on a disposable tree
+
+```bash
+mkdir -p /tmp/rclone-sync-test/sub
+printf 'a\n' > /tmp/rclone-sync-test/a.txt
+printf 'b\n' > /tmp/rclone-sync-test/sub/b.txt
+./rclone sync /tmp/rclone-sync-test icloud:rclone-test/sync --dry-run
+./rclone sync /tmp/rclone-sync-test icloud:rclone-test/sync
+./rclone ls icloud:rclone-test/sync
+```
+
+## Filename coverage
+
+- [ ] Spaces in names
+- [ ] Unicode names
+- [ ] Nested paths
+
+```bash
+printf 'x\n' > "/tmp/file with spaces.txt"
+printf 'y\n' > "/tmp/unicode-ngalan-ß.txt"
+./rclone copyto "/tmp/file with spaces.txt" "icloud:rclone-test/file with spaces.txt"
+./rclone copyto "/tmp/unicode-ngalan-ß.txt" "icloud:rclone-test/unicode-ngalan-ß.txt"
+./rclone ls icloud:rclone-test
+```
+
+## Cleanup
+
+- [ ] `./rclone purge icloud:rclone-test`
+- [ ] Confirm the disposable test tree is gone
+
+## Minimum confidence bar
+
+Before opening the PR, at least verify:
+
+- [ ] fresh config
+- [ ] reconnect
+- [ ] ls/lsd
+- [ ] mkdir/rmdir
+- [ ] upload/download
+- [ ] move/delete
+- [ ] one sync round-trip
+- [ ] one ADP-enabled access path
